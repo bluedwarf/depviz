@@ -1,0 +1,280 @@
+#!/usr/bin/ruby
+
+# dpkg-depviz - a tool to draw dependency graph of debian packages
+# Copyright (C) 2010 Takashi Nakamoto <bluedwarf@bpost.plala.or.jp>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+# On Ubuntu, you need to install "libgv-ruby" package.
+require 'gv'
+
+$format = "dot"
+$out_file = nil
+
+def show_usage(ext_code=nil)
+  STDERR.puts <<EOU
+Usage: dpkg-depviz [OPTION]... PACKAGE...
+
+  -f   Specifies output format.
+       If this option is not specified, it defaults "dot".
+       The supported output format can be obtained by executing
+       "dot -Txxx" (where xxx is an unlikely format), if you 
+  -o   Specifies output file name.
+       If this option is not specified, it outputs the result to standard
+       output.
+  -h   Shows this help message and quits immediately.
+
+Description:
+ This command draws dependency graph of debian packages so that you can
+ see the packages that the specified packages depend on. Since it relies
+ on the information obtained by "dpkg-query", all the relevent packages
+ should be installed in your local machine beforehand. Otherwise, those
+ package names will be colored by blue or red in the drawn graph.
+
+Example:
+ $ dpkg-depviz -f png -o dpkg-dep.png dpkg
+
+ It draws the dependency graph of the packages that "dpkg" depends on,
+ and finally outputs the graph as dpkg-dep.png in PNG format.
+EOU
+
+  if ext_code
+    exit ext_code
+  end
+end
+
+#############################
+# Argument processing
+#############################
+
+show_usage(1) if ARGV.empty?
+
+while !ARGV.empty?
+  arg = ARGV.shift
+
+  if arg == "-f"
+    show_usage(1) if ARGV.empty?
+    $format = ARGV.shift
+    show_usage(1) if $format =~ /^\-/
+  elsif arg == "-o"
+    show_usage(1) if ARGV.empty?
+    $out_file = ARGV.shift
+    show_usage(1) if $out_file =~ /^\-/
+  elsif arg == "-h"
+    show_usage(0)
+  else
+    arg_pkgs = [arg]
+    break
+  end
+end
+
+show_usage(1) if arg_pkgs.nil?
+
+arg_pkgs.concat(ARGV)
+
+if arg_pkgs.empty?
+  show_usage(1)
+end
+
+#############################
+# Package class
+#############################
+class Package
+  # Query command to get the properties of package
+  # "@@@" will be replaced by a package name.
+  STATUS_COMMAND = "dpkg-query -W -f='${Status}' @@@"
+  VERSION_COMMAND = "dpkg-query -W -f='${Version}' @@@"
+
+  # TODO:
+  #  Figure out the difference between "Depends" and "Pre-Depends"
+  #  and add option to remove "Pre-Depends" dependency from the graph.
+  DEPENDS_COMMAND = "dpkg-query -W -f='${Depends} ${Pre-Depends}' @@@"
+
+  def initialize(gvc, name)
+    @name = name
+    @gvc = gvc
+    @gv_node = Gv.node(@gvc, @name)
+
+    # Get properties based on dpkg-qeury command.
+    [[STATUS_COMMAND, :set_status],
+     [VERSION_COMMAND, :set_version],
+     [DEPENDS_COMMAND, :set_depends]].each { |cmd_tmp, parser|
+      cmd = cmd_tmp.gsub("@@@", @name)
+      output = `#{cmd} 2> /dev/null`
+      send(parser, output)
+    }
+
+    # Set graphviz attributes
+    Gv.setv(@gv_node, "label", "#{@name}\n#{@version}")
+    if @installed
+      Gv.setv(@gv_node, "color", "black")
+    else
+      # TODO:
+      #  Show legends of those colors.
+      # TODO:
+      #  Use more fancy color schemes.
+      if @invalid
+        Gv.setv(@gv_node, "color", "blue")
+      else
+        Gv.setv(@gv_node, "color", "red")
+      end
+    end
+  end
+
+  # Valid states (ref. "man dpkg")
+  VALID_STATES = ["not-installed",
+                  "config-files",
+                  "half-installed",
+                  "unpacked",
+                  "half-configured",
+                  "triggers-awaited",
+                  "triggers-pending",
+                  "installed"]
+
+  def set_status(arg)
+    state = arg.split(" ")[-1]
+    if VALID_STATES.include?(state)
+      @invalid = false
+      if state == "installed"
+        @installed = true
+      else
+        @installed = false
+      end
+    else
+      @installed = false
+      @invalid = true
+    end
+  end
+
+  def set_version(arg)
+    @version = @invalid ? nil : arg
+  end
+
+  # Seperator between packages in the output of the query command.
+  SEPARATOR_AND = ','
+  SEPARATOR_OR = '|'
+
+  PKG_NAME_REGEX = /(\w[\w\d\-]*)/
+
+  def set_depends(arg)
+    arg.strip!
+
+    @depends = arg.split(SEPARATOR_AND)
+    @depends.map! { |a|
+      a.split(SEPARATOR_OR).map { |o|
+        if o =~ PKG_NAME_REGEX
+          $1
+        else
+          raise Exception.new("Invalid package name: #{a}")
+        end
+      }
+    }
+
+    # TODO: Support "|".
+    @depends.flatten!
+
+    # Add an edge for each dependency
+    @depends.each { |dist|
+      Gv.edge(@gvc, name, dist)
+    }
+  end
+
+  def name
+    @name
+  end
+
+  def depends
+    @depends
+  end
+
+  def installed?
+    @installed
+  end
+
+  def version
+    @version
+  end
+
+  def to_s
+    if @installed
+      "#{@name} #{@version}"
+    else
+      "#{@name}"
+    end
+  end
+end
+
+class Packages < Hash
+  # This methods first looks for the specified package name.
+  # If it finds the designated package, the package is registered
+  # in this hash, and returns a package object.
+  #
+  # If this hash already has the specified package name, this methods
+  # just returns the specified package.
+  #
+  # If this method fails to find the designated package, it returns nil.
+  def add(name)
+    return self[name] if include?(name)
+
+    pkg = Package.new(name)
+    
+    return pkg
+  end
+end
+
+#############################
+# Main routine
+#############################
+pkgs = {}
+queue = []
+gvc = Gv.digraph("Dependency")
+
+arg_pkgs.each { |name|
+  if !pkgs.include?(name)
+    pkg = Package.new(gvc, name)
+    pkgs[name] = pkg
+    queue.push(pkg)
+  end
+}
+
+STDERR.puts "Processing debian packages..."
+
+while !queue.empty?
+  pkg = queue.shift
+
+  pkg.depends.each { |name|
+    unless pkgs.include?(name)
+      new_pkg = Package.new(gvc, name)
+      pkgs[name] = new_pkg
+      queue.push(new_pkg)
+    end
+  }
+
+  # Show the progress.
+  STDERR.print "#"
+  STDERR.flush
+end
+
+STDOUT.print "\n\n"
+
+Gv.layout(gvc, "dot")
+
+if $out_file
+  Gv.render(gvc, $format, $out_file)
+  STDERR.puts "Finished. Dependency graph is saved as #{$out_file}."
+else
+  Gv.render(gvc, $format)
+end
+
